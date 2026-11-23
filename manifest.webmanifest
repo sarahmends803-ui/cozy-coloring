@@ -1,1 +1,24 @@
-manifest.webmanifes
+
+{
+  "id": "/cozy-coloring/",
+  "name": "Cozy Pastel Coloring Studio",
+  "short_name": "Tablu",
+  "start_url": "/cozy-coloring/",
+  "scope": "/cozy-coloring/",
+  "display": "standalone",
+  "background_color": "#fff7fb",
+  "theme_color": "#f8dce8",
+  "icons": [
+    {
+      "src": "/cozy-coloring/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/cozy-coloring/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
+
