@@ -1,4 +1,4 @@
-sw.js
+
 
 
 const CACHE_NAME = "tablu-coloring-v1";
