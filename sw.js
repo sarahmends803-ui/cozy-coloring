@@ -1,51 +1,23 @@
-
-
-
-const CACHE_NAME = "tablu-coloring-v1";
-
-const FILES_TO_CACHE = [
-  "./",
-  "./icon-192.png",
-  "./icon-512.png"
-];
-
-self.addEventListener("install", event => {
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(FILES_TO_CACHE))
-      .then(() => self.skipWaiting())
-  );
+const V = 'tablu-v3';
+const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(V).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
 });
-
-self.addEventListener("activate", event => {
-  event.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(
-        keys
-          .filter(key => key !== CACHE_NAME)
-          .map(key => caches.delete(key))
-      )
-    ).then(() => self.clients.claim())
-  );
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
-
-self.addEventListener("fetch", event => {
-  if (event.request.method !== "GET") return;
-
-  const url = new URL(event.request.url);
-
-  if (url.origin !== self.location.origin) return;
-
-  if (event.request.mode === "navigate") {
-    event.respondWith(
-      fetch(event.request)
-        .then(response => {
-          const copy = response.clone();
-          caches.open(CACHE_NAME)
-            .then(cache => cache.put("./", copy));
-          return response;
-        })
-        .catch(() => caches.match("./"))
-    );
+self.addEventListener('fetch', e => {
+  const r = e.request;
+  if (r.method !== 'GET') return;
+  const u = new URL(r.url);
+  if (u.origin === location.origin) {
+    // newest version when online, saved copy when offline
+    e.respondWith(fetch(r).then(res => { if (res.ok) { const copy = res.clone(); caches.open(V).then(c => c.put(r, copy)); } return res; })
+      .catch(() => caches.match(r, { ignoreSearch: true }).then(hit => hit || caches.match('./index.html'))));
+  } else if (/(fonts\.googleapis\.com|fonts\.gstatic\.com|cdnjs\.cloudflare\.com)$/.test(u.host)) {
+    e.respondWith(caches.match(r).then(hit => hit || fetch(r).then(res => {
+      if (res.ok || res.type === 'opaque') { const copy = res.clone(); caches.open(V).then(c => c.put(r, copy)); }
+      return res;
+    })));
   }
 });
