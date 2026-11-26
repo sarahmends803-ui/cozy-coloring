@@ -1,0 +1,17 @@
+HOW TO ADD YOUR OWN COLORING PAGES (they will show for everyone)
+
+1. Put your picture in this "pages" folder on GitHub (Add file > Upload files).
+   PNG, JPG or WebP. Black outlines on a white background work best.
+   Use simple names, no spaces, e.g. cozy-bedroom.png
+2. Open pages.json here, tap the pencil (edit), and add one line per picture inside the [ ] like this:
+
+[
+  {"file": "cozy-bedroom.png", "title": "Cozy bedroom", "category": "Cozy Rooms"},
+  {"file": "bunny.png", "title": "Sleepy bunny", "category": "Cute Animals", "featured": true}
+]
+
+   Put a comma after every line except the last one.
+   Categories (type exactly): Cozy Rooms, Cute Animals, Cafes and Food, Everyday Cozy Moments, Flowers and Seasons
+   "featured": true is optional and shows the page on the home page.
+   Pages lower in the list count as newer.
+3. Commit. After about 2 minutes the pages appear in Coloring Pages for everyone.

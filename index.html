@@ -316,7 +316,7 @@ body.set-collapsed .set-adv{display:none}
     </div>
     <div class="warn" id="memWarn" hidden>Your browser is not allowing permanent storage here, so your library will disappear when this tab closes. Use the backup below to keep it.</div>
 
-    <div class="sechead"><div><h2 id="hPics">Uploaded Pictures</h2><p>Your original pictures, exactly as you added them. PNG, JPG, WebP and PDF.</p></div></div>
+    <div class="sechead"><div><h2 id="hPics">Uploaded Pictures</h2><p>Your original pictures, exactly as you added them. They stay here until you press I'm Finished.</p></div></div>
     <div class="grid" id="picGrid" aria-labelledby="hPics"></div>
 
     <div class="sechead"><div><h2 id="hDone">Finished Coloring Pages</h2><p>Press I'm Finished in the studio to add a page here.</p></div></div>
@@ -390,7 +390,7 @@ body.set-collapsed .set-adv{display:none}
 
     <div class="settings" id="settings">
       <button class="colorbtn" id="btnColor" type="button" aria-expanded="false" aria-controls="palette" title="Open the color palette"><i class="sw0" id="curSw"></i><span class="nm" id="curName">Baby pink</span><span data-ic="chevup" data-size="16"></span></button>
-      <div class="grp" id="grpSize"><label for="size">Size</label><input id="size" type="range" min="1" max="80" value="16"><output id="sizeVal">16</output></div>
+      <div class="grp" id="grpSize"><label for="size">Size</label><input id="size" type="range" min="0.5" max="80" step="0.5" value="16"><output id="sizeVal">16</output></div>
       <div class="grp" id="grpOpac"><label for="opac">Opacity</label><input id="opac" type="range" min="5" max="100" value="100"><output id="opacVal">100%</output></div>
       <div class="grp"><button class="icon-btn" id="btnUndo" type="button" aria-label="Undo" title="Undo (Ctrl+Z)"><span data-ic="undo" data-size="20"></span></button>
         <button class="icon-btn" id="btnRedo" type="button" aria-label="Redo" title="Redo (Ctrl+Shift+Z)"><span data-ic="redo" data-size="20"></span></button></div>
@@ -574,8 +574,16 @@ const pctx=paint.getContext('2d'),lctx=live.getContext('2d');
 const scratch=document.createElement('canvas'),sctx=scratch.getContext('2d');
 const analysis=document.createElement('canvas'),actx=analysis.getContext('2d',{willReadFrequently:true});
 
-/* ---------- outline regions (for Fill and Color Inside Lines) ---------- */
-let wall=null,labels=null,bbs=[],maskCache=new Map();
+/* ---------- outline regions (for Fill and Color Inside Lines) ----------
+   Every pixel of the page ends up owned by at most one region, so there are no gaps and no overlaps:
+   1. dark pixels (and anti-aliased edge pixels) are outline "walls"
+   2. regions are found with a gently thickened wall, which seals tiny breaks in a line
+   3. spaces so small they vanish under that thickening get their own region (not given to a neighbour)
+   4. every region then grows into the outline pixels beside it. It grows right through a soft or blurry
+      edge until the pixels are dark enough to be hidden by the black line drawn on top, so paint reaches
+      the outline edge-to-edge and nothing is left white. */
+let wall=null,rawWall=null,lumKeep=null,labels=null,bbs=[],maskCache=new Map();
+const NEAR=3,COVER=50,MIN_TINY=4;   // paint always reaches NEAR px into an outline, and keeps going while the outline is still lighter than COVER
 function dilate(a,bw,bh,R){
   const b=new Uint8Array(a.length),c=new Uint8Array(a.length);
   for(let y=0;y<bh;y++){const o=y*bw;let last=-1e9;
@@ -586,6 +594,19 @@ function dilate(a,bw,bh,R){
     last=1e9;for(let y=bh-1;y>=0;y--){if(b[y*bw+x])last=y;if(last-y<=R)c[y*bw+x]=1}}
   return c;
 }
+/* local darkest / lightest value within R pixels (sliding window by doubling, so it stays fast) */
+function rangeFilter(src,w,h,R,isMax){
+  const K=2*R+1;let p=1;while(p*2<=K)p*=2;
+  const line=new Uint8Array(Math.max(w,h)),res=new Uint8Array(Math.max(w,h)),tmp=new Uint8Array(src.length),out=new Uint8Array(src.length);
+  const run=n=>{
+    for(let s=1;s<p;s*=2)for(let i=0;i<n;i++){const a=line[i],b=line[i+s<n?i+s:n-1];line[i]=isMax?(a>b?a:b):(a<b?a:b)}
+    for(let i=0;i<n;i++){const a=line[i],b=line[i+K-p<n?i+K-p:n-1];line[i]=isMax?(a>b?a:b):(a<b?a:b)}
+    for(let c=0;c<n;c++)res[c]=line[c-R>0?c-R:0];
+  };
+  for(let y=0;y<h;y++){const o=y*w;for(let x=0;x<w;x++)line[x]=src[o+x];run(w);for(let x=0;x<w;x++)tmp[o+x]=res[x]}
+  for(let x=0;x<w;x++){for(let y=0;y<h;y++)line[y]=tmp[y*w+x];run(h);for(let y=0;y<h;y++)out[y*w+x]=res[y]}
+  return out;
+}
 function prepareWalls(img){
   const w=S.w,h=S.h,N=w*h;
   analysis.width=w;analysis.height=h;
@@ -595,65 +616,153 @@ function prepareWalls(img){
   let acc=0,dark=0;const target=N*.003;
   for(let v=0;v<256;v++){acc+=hist[v];if(acc>=target){dark=v;break}}
   const thr=clamp(dark+(255-dark)*.72,125,225),raw=new Uint8Array(N);
-  for(let i=0;i<N;i++)raw[i]=lum[i]<thr?1:0;
-  wall=dilate(raw,w,h,1);labels=null;bbs=[];maskCache.clear();
+  /* Where ink and paper meet, the true edge of a line is half way between them. Using that local half-way
+     value (not one fixed cut-off for the whole page) keeps narrow spaces on blurred or soft outlines
+     from being swallowed by the outline. Flat paper keeps the page-wide cut-off. */
+  const R=Math.max(4,Math.round(6*S.scaleRef)),mn=rangeFilter(lum,w,h,R,false),mx=rangeFilter(lum,w,h,R,true);
+  for(let i=0;i<N;i++){
+    const rg=mx[i]-mn[i];let t=thr;
+    if(rg>=60){t=mn[i]+rg*.5;if(t>225)t=225}
+    raw[i]=lum[i]<t?1:0;
+  }
+  rawWall=raw;lumKeep=lum;wall=dilate(raw,w,h,1);labels=null;bbs=[];maskCache.clear();
   analysis.width=analysis.height=1;
 }
 function ensureRegions(){
-  if(labels||!wall) return;
+  if(labels||!wall)return;
   const w=S.w,h=S.h,N=w*h;labels=new Int32Array(N);
   for(let i=0;i<N;i++)if(wall[i])labels[i]=-1;
   const q=new Int32Array(N);bbs=[null];let n=0;
+  /* pass 1: regions bounded by the (sealed) outline. Pixels touching diagonally count as joined, so a
+     thin curved space stays in one piece instead of breaking into fragments. */
   for(let s=0;s<N;s++){
     if(labels[s]!==0)continue;
     n++;let qh=0,qt=0,x0=w,y0=h,x1=0,y1=0;q[qt++]=s;labels[s]=n;
     while(qh<qt){
       const p=q[qh++],x=p%w,y=(p-x)/w;
       if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;
-      if(x>0&&labels[p-1]===0){labels[p-1]=n;q[qt++]=p-1}
-      if(x<w-1&&labels[p+1]===0){labels[p+1]=n;q[qt++]=p+1}
-      if(y>0&&labels[p-w]===0){labels[p-w]=n;q[qt++]=p-w}
-      if(y<h-1&&labels[p+w]===0){labels[p+w]=n;q[qt++]=p+w}
+      for(let dy=-1;dy<=1;dy++){
+        const ny=y+dy;if(ny<0||ny>=h)continue;
+        for(let dx=-1;dx<=1;dx++){
+          const nx=x+dx;if(nx<0||nx>=w||(dx===0&&dy===0))continue;
+          const m=ny*w+nx;if(labels[m]===0){labels[m]=n;q[qt++]=m}
+        }
+      }
     }
     bbs.push([x0,y0,x1,y1]);
   }
-  wall=null;
+  /* a sealed region counts as "thick" if some pixel has all 8 neighbours in the same region. Thin sealed
+     slivers are only pieces of a thin shape (a narrow ring, a slim petal), never a real region on their own. */
+  const thick=new Uint8Array(n+1);
+  for(let y=1;y<h-1;y++)for(let x=1,p=y*w+1;x<w-1;x++,p++){
+    const l=labels[p];if(l<=0||thick[l])continue;
+    if(labels[p-1]===l&&labels[p+1]===l&&labels[p-w]===l&&labels[p+w]===l&&labels[p-w-1]===l&&labels[p-w+1]===l&&labels[p+w-1]===l&&labels[p+w+1]===l)thick[l]=1;
+  }
+  /* pass 2: look at the real (un-thickened) blank areas.
+     - one blank area that holds exactly one sealed region: the region takes ALL of it, including the
+       edge pixels the thickening removed (no missing pixels around the edge, thin shapes stay whole)
+     - a blank area holding no sealed region is a tiny space the thickening swallowed: it becomes its own region
+     - a blank area holding several real (thick) sealed regions was joined by a leak in the outline: keep them apart */
+  for(let s=0;s<N;s++){
+    if(rawWall[s])continue;
+    let qh=0,qt=0,first=0,thk=0,multi=false,x0=w,y0=h,x1=0,y1=0;q[qt++]=s;rawWall[s]=2;
+    while(qh<qt){
+      const p=q[qh++],x=p%w,y=(p-x)/w,l=labels[p];
+      if(l>0){if(!first)first=l;if(thick[l]){if(!thk)thk=l;else if(l!==thk)multi=true}}
+      if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;
+      if(x>0&&!rawWall[p-1]){rawWall[p-1]=2;q[qt++]=p-1}
+      if(x<w-1&&!rawWall[p+1]){rawWall[p+1]=2;q[qt++]=p+1}
+      if(y>0&&!rawWall[p-w]){rawWall[p-w]=2;q[qt++]=p-w}
+      if(y<h-1&&!rawWall[p+w]){rawWall[p+w]=2;q[qt++]=p+w}
+    }
+    if(multi)continue;
+    if(first){
+      if(thk)first=thk;
+      for(let i=0;i<qt;i++)labels[q[i]]=first;
+      const b=bbs[first];if(x0<b[0])b[0]=x0;if(y0<b[1])b[1]=y0;if(x1>b[2])b[2]=x1;if(y1>b[3])b[3]=y1;
+    }
+  }
+  /* pass 2b: blank pixels still unowned are tiny spaces the thickening swallowed (a thin curved gap, a
+     small petal). Pixels touching diagonally are joined so a thin ring is one region, not many bits.
+     Blank bits right beside an existing region are only its edge: they are picked up in pass 3. */
+  for(let s=0;s<N;s++){
+    if(rawWall[s]!==2||labels[s]!==-1)continue;
+    let qh=0,qt=0,touch=false,x0=w,y0=h,x1=0,y1=0;q[qt++]=s;labels[s]=-2;
+    while(qh<qt){
+      const p=q[qh++],x=p%w,y=(p-x)/w;
+      if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;
+      for(let dy=-1;dy<=1;dy++){
+        const ny=y+dy;if(ny<0||ny>=h)continue;
+        for(let dx=-1;dx<=1;dx++){
+          const nx=x+dx;if(nx<0||nx>=w||(dx===0&&dy===0))continue;
+          const m=ny*w+nx,l=labels[m];
+          if(l>0)touch=true;else if(l===-1&&rawWall[m]===2){labels[m]=-2;q[qt++]=m}
+        }
+      }
+    }
+    if(!touch&&qt>=MIN_TINY){n++;for(let i=0;i<qt;i++)labels[q[i]]=n;bbs.push([x0,y0,x1,y1])}
+    else for(let i=0;i<qt;i++)labels[q[i]]=-3;
+  }
+  for(let i=0;i<N;i++)if(labels[i]===-3)labels[i]=-1;
+  /* pass 3: every region grows into the outline pixels next to it (closest region wins) */
+  let qh=0,qt=0;
+  for(let y=0,p=0;y<h;y++)for(let x=0;x<w;x++,p++){
+    if(labels[p]<=0)continue;
+    if((x>0&&labels[p-1]===-1)||(x<w-1&&labels[p+1]===-1)||(y>0&&labels[p-w]===-1)||(y<h-1&&labels[p+w]===-1))q[qt++]=p;
+  }
+  const lm=lumKeep,LMAX=Math.max(8,Math.round(12*S.scaleRef));
+  for(let lvl=1;lvl<=LMAX;lvl++){
+    const end=qt;
+    while(qh<end){
+      const p=q[qh++],l=labels[p],x=p%w,y=(p-x)/w,b=bbs[l];
+      for(let k=0;k<4;k++){
+        let nx=x,ny=y;if(k===0)nx--;else if(k===1)nx++;else if(k===2)ny--;else ny++;
+        if(nx<0||ny<0||nx>=w||ny>=h)continue;
+        const m=ny*w+nx;
+        if(labels[m]===-1&&(lvl<=NEAR||lm[m]>=COVER)){labels[m]=l;q[qt++]=m;if(nx<b[0])b[0]=nx;if(nx>b[2])b[2]=nx;if(ny<b[1])b[1]=ny;if(ny>b[3])b[3]=ny}
+      }
+    }
+  }
+  wall=null;rawWall=null;lumKeep=null;
 }
+/* which region is at this spot? If the tap lands on a thick outline, use the closest region. */
 function regionAt(px,py){
   ensureRegions();if(!labels)return 0;
-  const w=S.w,h=S.h,x=clamp(Math.round(px),0,w-1),y=clamp(Math.round(py),0,h-1),L=labels[y*w+x];
+  const w=S.w,h=S.h,x=clamp(Math.floor(px),0,w-1),y=clamp(Math.floor(py),0,h-1),L=labels[y*w+x];
   if(L>0)return L;
-  for(let r=1;r<=10;r++)for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
-    if(Math.max(Math.abs(dx),Math.abs(dy))!==r)continue;
-    const xx=x+dx,yy=y+dy;if(xx<0||yy<0||xx>=w||yy>=h)continue;
-    const l=labels[yy*w+xx];if(l>0)return l;
+  const R=Math.max(14,Math.round(8*S.scaleRef));
+  for(let r=1;r<=R;r++){
+    let best=0,bd=1e9;
+    for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+      if(Math.max(Math.abs(dx),Math.abs(dy))!==r)continue;
+      const xx=x+dx,yy=y+dy;if(xx<0||yy<0||xx>=w||yy>=h)continue;
+      const l=labels[yy*w+xx];if(l>0){const dd=dx*dx+dy*dy;if(dd<bd){bd=dd;best=l}}
+    }
+    if(best)return best;
   }
   return 0;
 }
+/* the exact pixels of one region (no fixed-size growth, so nothing leaks into a neighbour) */
 function getMask(L){
   if(maskCache.has(L)){const m=maskCache.get(L);maskCache.delete(L);maskCache.set(L,m);return m}
-  const w=S.w,h=S.h,R=3,b=bbs[L];
-  const X0=Math.max(0,b[0]-R),Y0=Math.max(0,b[1]-R),X1=Math.min(w-1,b[2]+R),Y1=Math.min(h-1,b[3]+R),bw=X1-X0+1,bh=Y1-Y0+1;
-  const a=new Uint8Array(bw*bh);
-  for(let y=b[1];y<=b[3];y++)for(let x=b[0];x<=b[2];x++)if(labels[y*w+x]===L)a[(y-Y0)*bw+(x-X0)]=1;
-  const c=dilate(a,bw,bh,R),img=new ImageData(bw,bh),d=img.data;
-  for(let i=0;i<c.length;i++)if(c[i])d[i*4+3]=255;
-  const cv=document.createElement('canvas');cv.width=w;cv.height=h;cv.getContext('2d').putImageData(img,X0,Y0);
-  const m={canvas:cv,box:[X0,Y0,bw,bh]};
+  const w=S.w,h=S.h,b=bbs[L],bw=b[2]-b[0]+1,bh=b[3]-b[1]+1;
+  const img=new ImageData(bw,bh),d=img.data;
+  for(let y=b[1];y<=b[3];y++){const o=y*w;for(let x=b[0];x<=b[2];x++)if(labels[o+x]===L)d[((y-b[1])*bw+(x-b[0]))*4+3]=255}
+  const cv=document.createElement('canvas');cv.width=w;cv.height=h;cv.getContext('2d').putImageData(img,b[0],b[1]);
+  const m={canvas:cv,box:[b[0],b[1],bw,bh]};
   maskCache.set(L,m);if(maskCache.size>2)maskCache.delete(maskCache.keys().next().value);
   return m;
 }
-
 /* ---------- undo / redo (stores only the changed rectangle) ---------- */
 let hist=[],hpos=0;
-function histBytes(){let t=0;for(const e of hist)t+=e.before.data.length+e.after.data.length;return t}
+function histBytes(){let t=0;for(const e of hist)t+=e.before.data.length+(e.after?e.after.data.length:0);return t}
 function pushHist(e){
   hist.length=hpos;hist.push(e);hpos++;
   while(hist.length>80||(hist.length>1&&histBytes()>380e6)){hist.shift();hpos--}
   markChanged();syncHist();
 }
 function syncHist(){$('#btnUndo').disabled=hpos===0;$('#btnRedo').disabled=hpos>=hist.length}
-function undo(){if(stroke||!hpos)return;const e=hist[--hpos];pctx.putImageData(e.before,e.x,e.y);markChanged();syncHist()}
+function undo(){if(stroke||!hpos)return;const e=hist[--hpos];if(!e.after)e.after=pctx.getImageData(e.x,e.y,e.before.width,e.before.height);pctx.putImageData(e.before,e.x,e.y);markChanged();syncHist()}
 function redo(){if(stroke||hpos>=hist.length)return;const e=hist[hpos++];pctx.putImageData(e.after,e.x,e.y);markChanged();syncHist()}
 function resetHist(){hist=[];hpos=0;syncHist()}
 function crop(img,x,y,w,h){
@@ -742,7 +851,7 @@ function startStroke(p,e){
     if(S.inside){const L=regionAt(p.x,p.y);if(L)stroke.mask=getMask(L);else stroke.skip=true}
   }
   if(stroke.skip){toast('Start inside a shape to color it');return}
-  sound.start(t);drawSeg(p,p,true);
+  sound.start(t);drawSeg(p,p,true);stroke.mid=p;
 }
 function cancelStroke(){
   if(!stroke)return;const st=stroke;stroke=null;sound.stop();
@@ -750,15 +859,17 @@ function cancelStroke(){
   lctx.clearRect(0,0,S.w,S.h);
 }
 function endStroke(){
-  if(!stroke)return;const st=stroke;stroke=null;sound.stop();
+  if(!stroke)return;
+  if(!stroke.skip&&stroke.mid&&(stroke.mid.x!==stroke.last.x||stroke.mid.y!==stroke.last.y))drawSeg(stroke.mid,stroke.last,false);
+  const st=stroke;stroke=null;sound.stop();
   if(st.skip)return;
   const bb=st.bbox,x0=Math.floor(clamp(bb[0],0,S.w-1)),y0=Math.floor(clamp(bb[1],0,S.h-1)),x1=Math.ceil(clamp(bb[2],1,S.w)),y1=Math.ceil(clamp(bb[3],1,S.h)),bw=Math.max(1,x1-x0),bh=Math.max(1,y1-y0);
   if(st.tool==='eraser'){
-    pushHist({x:x0,y:y0,before:crop(st.before,x0,y0,bw,bh),after:pctx.getImageData(x0,y0,bw,bh)});
+    pushHist({x:x0,y:y0,before:crop(st.before,x0,y0,bw,bh),after:null});
   }else{
     const before=pctx.getImageData(x0,y0,bw,bh);
     pctx.save();pctx.globalAlpha=prefs[st.tool].op/100;pctx.drawImage(live,x0,y0,bw,bh,x0,y0,bw,bh);pctx.restore();
-    pushHist({x:x0,y:y0,before,after:pctx.getImageData(x0,y0,bw,bh)});noteColor();
+    pushHist({x:x0,y:y0,before,after:null});noteColor();
     lctx.clearRect(0,0,S.w,S.h);
   }
 }
@@ -770,7 +881,7 @@ function doFill(p){
   sctx.globalCompositeOperation='destination-in';sctx.drawImage(m.canvas,x,y,w,h,x,y,w,h);sctx.restore();
   const before=pctx.getImageData(x,y,w,h);
   pctx.save();pctx.globalAlpha=prefs.fill.op/100;pctx.drawImage(scratch,x,y,w,h,x,y,w,h);pctx.restore();
-  pushHist({x,y,before,after:pctx.getImageData(x,y,w,h)});noteColor();
+  pushHist({x,y,before,after:null});noteColor();
   sound.pop();
 }
 
@@ -951,8 +1062,31 @@ const BUILTINS=[
 ];
 const BUILTIN_MAP={};BUILTINS.forEach(b=>{BUILTIN_MAP[b.id]=b});
 const svgBlobOf=b=>new Blob([b.svg()],{type:'image/svg+xml'});
+const blobOfPage=async b=>{
+  if(!b.file)return svgBlobOf(b);
+  const r=await fetch(b.file);if(!r.ok)throw new Error('missing');
+  const bl=await r.blob();if(bl.type&&/^image\//.test(bl.type))return bl;
+  const m={png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',svg:'image/svg+xml'}[(b.file.split('.').pop()||'').toLowerCase()]||'image/png';
+  return new Blob([bl],{type:m});
+};
 const biUrls={};
-const builtinThumb=b=>biUrls[b.id]||(biUrls[b.id]=URL.createObjectURL(svgBlobOf(b)));
+const builtinThumb=b=>b.file?b.file:(biUrls[b.id]||(biUrls[b.id]=URL.createObjectURL(svgBlobOf(b))));
+/* pages you add yourself: put pictures in the "pages" folder and list them in pages/pages.json */
+async function loadExtraPages(){
+  try{
+    const r=await fetch('pages/pages.json',{cache:'no-cache'});if(!r.ok)return;
+    const list=await r.json();if(!Array.isArray(list))return;
+    list.forEach((e,i)=>{
+      if(!e||typeof e.file!=='string'||!/\.(png|jpe?g|webp|svg)$/i.test(e.file))return;
+      const file=e.file.startsWith('pages/')?e.file:'pages/'+e.file,id='f-'+file.replace(/^pages\//,'').replace(/\.[^.]+$/,'').toLowerCase().replace(/[^a-z0-9]+/g,'-');
+      if(BUILTIN_MAP[id])return;
+      const cat=String(e.category||e.cat||'').trim()||CATS[0];if(!CATS.includes(cat))CATS.push(cat);
+      const t=e.added?Date.parse(e.added):NaN;
+      const b={id,title:String(e.title||file.replace(/^pages\//,'').replace(/\.[^.]+$/,'')).slice(0,60),cat,added:isNaN(t)?T0+100+i:t,featured:e.featured?1:0,file};
+      BUILTINS.push(b);BUILTIN_MAP[id]=b;
+    });
+  }catch(e){}
+}
 
 /* ---------- load a page ---------- */
 const nameEl=$('#pageName');
@@ -960,20 +1094,25 @@ async function loadPage(o){
   const url=URL.createObjectURL(o.blob),img=new Image();img.src=url;
   try{await img.decode()}catch(e){URL.revokeObjectURL(url);toast("That image couldn't be opened. Try another PNG or JPG.");return false}
   cancelStroke();
-  const nw=img.naturalWidth||1000,nh=img.naturalHeight||1000,k=Math.min(1,MAXSIDE/Math.max(nw,nh));
-  S.natW=nw;S.natH=nh;S.w=Math.max(1,Math.round(nw*k));S.h=Math.max(1,Math.round(nh*k));S.scaleRef=Math.max(S.w,S.h)/1000;
+  const nw=img.naturalWidth||1000,nh=img.naturalHeight||1000,long=Math.max(nw,nh);
+  let bmp=null;if(o.paintBlob){try{bmp=await createImageBitmap(o.paintBlob)}catch(e){}}
+  /* work at a higher resolution so tiny details are many pixels wide (saved projects keep their own size) */
+  let k=Math.min(1,MAXSIDE/long);
+  if(!bmp){if(/svg/.test(o.blob.type||''))k=1600/long;else if(long<1600)k=Math.min(2,1600/long)}
+  S.natW=nw;S.natH=nh;S.w=Math.max(1,Math.round(nw*k));S.h=Math.max(1,Math.round(nh*k));
+  if(bmp&&bmp.width>0&&bmp.height>0){S.w=bmp.width;S.h=bmp.height}S.scaleRef=Math.max(S.w,S.h)/1000;
   paint.width=live.width=scratch.width=S.w;paint.height=live.height=scratch.height=S.h;
   linesEl.src=url;if(S.srcUrl)URL.revokeObjectURL(S.srcUrl);
   S.srcUrl=url;S.srcImg=img;S.srcBlob=o.blob;S.pictureId=o.pictureId||null;S.projectId=o.projectId||null;S.status=o.status||'wip';S.isSample=!!o.sample;S.picName=o.picName||o.name||'';S.finalBlob=o.finalBlob||null;clearTimeout(saveT);
-  if(o.paintBlob){try{const bmp=await createImageBitmap(o.paintBlob);pctx.drawImage(bmp,0,0,S.w,S.h)}catch(e){}}
+  if(bmp){try{pctx.drawImage(bmp,0,0,S.w,S.h)}catch(e){}}
   nameEl.value=o.name||'';updateNameLabel();resetHist();S.dirty=false;setSaveState(S.projectId?'saved':'new');
   prepareWalls(img);S.zoom=1;fitView();syncFavPage();
-  if(k<1)toast('Large picture: colors are saved at a slightly smaller size');
+  if(long>MAXSIDE)toast('Large picture: colors are saved at a slightly smaller size');
   return true;
 }
 function clearColors(){
   cancelStroke();const before=pctx.getImageData(0,0,S.w,S.h);pctx.clearRect(0,0,S.w,S.h);
-  pushHist({x:0,y:0,before,after:pctx.getImageData(0,0,S.w,S.h)});
+  pushHist({x:0,y:0,before,after:null});
 }
 
 
@@ -992,7 +1131,7 @@ function relayout(){
 }
 function fitView(){S.zoom=1;vcx=vcy=.5;computeFit();applySize();viewport.scrollLeft=(viewport.scrollWidth-viewport.clientWidth)/2;viewport.scrollTop=(viewport.scrollHeight-viewport.clientHeight)/2}
 function setZoom(z,ax,ay){
-  z=clamp(z,.5,10);const vr=viewport.getBoundingClientRect();
+  z=clamp(z,.5,16);const vr=viewport.getBoundingClientRect();
   if(ax==null){ax=vr.left+vr.width/2;ay=vr.top+vr.height/2}
   const r=stage.getBoundingClientRect(),fx=(ax-r.left)/r.width,fy=(ay-r.top)/r.height;
   S.zoom=z;applySize();const r2=stage.getBoundingClientRect();
@@ -1043,7 +1182,7 @@ viewport.addEventListener('pointermove',e=>{
     const evs=typeof e.getCoalescedEvents==='function'?e.getCoalescedEvents():[];
     (evs.length?evs:[e]).forEach(ce=>{
       const p=pt(ce);if(stroke.pr!==1&&ce.pressure>0)stroke.pr=.4+ce.pressure*.9;
-      drawSeg(stroke.last,p,false);stroke.last=p;
+      strokeMove(p);
     });
     const dt=Math.max(4,e.timeStamp-stroke.ct);sound.move(Math.hypot(e.clientX-stroke.cx,e.clientY-stroke.cy)/dt);
     stroke.cx=e.clientX;stroke.cy=e.clientY;stroke.ct=e.timeStamp;
@@ -1059,6 +1198,20 @@ viewport.addEventListener('pointerleave',()=>{ring.style.display='none'});
 viewport.addEventListener('contextmenu',e=>e.preventDefault());
 viewport.addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey){e.preventDefault();setZoom(S.zoom*Math.exp(-e.deltaY*.0025),e.clientX,e.clientY)}},{passive:false});
 
+
+/* ---------- precision: smooth strokes ---------- */
+/* Strokes are drawn as smooth curves through the midpoints of the pointer samples, so they stay
+   round and neat when zoomed in, instead of turning into straight segments. */
+function strokeMove(p){
+  const st=stroke,l=st.last,s=st.mid||l,m={x:(l.x+p.x)/2,y:(l.y+p.y)/2};
+  const d=Math.hypot(m.x-s.x,m.y-s.y),n=clamp(Math.ceil(d/(3*S.scaleRef)),1,14);
+  let prev=s;
+  for(let i=1;i<=n;i++){
+    const t=i/n,u=1-t,q={x:u*u*s.x+2*u*t*l.x+t*t*m.x,y:u*u*s.y+2*u*t*l.y+t*t*m.y};
+    drawSeg(prev,q,false);prev=q;
+  }
+  st.mid=m;st.last=p;
+}
 
 /* ---------- editor: tools, settings, palette, Focus Mode, menu ---------- */
 let prefsReady=false,prefT=0,recents=[],favColors=[],favIds=[],colT=0;
@@ -1192,7 +1345,7 @@ async function loadPrefs(){
   recents=await kv.get('recent',[]);favColors=await kv.get('favColors',[]);favIds=await kv.get('favs',[]);
   if(!Array.isArray(recents))recents=[];if(!Array.isArray(favColors))favColors=[];if(!Array.isArray(favIds))favIds=[];
   if(p&&typeof p==='object'){
-    if(p.sizes)for(const k of Object.keys(p.sizes)){if(prefs[k]&&Array.isArray(p.sizes[k])){const [s,o]=p.sizes[k];if(prefs[k].size)prefs[k].size=clamp(+s||prefs[k].size,1,80);prefs[k].op=clamp(+o||prefs[k].op,5,100)}}
+    if(p.sizes)for(const k of Object.keys(p.sizes)){if(prefs[k]&&Array.isArray(p.sizes[k])){const [s,o]=p.sizes[k];if(prefs[k].size)prefs[k].size=clamp(+s||prefs[k].size,.5,80);prefs[k].op=clamp(+o||prefs[k].op,5,100)}}
     if(typeof p.inside==='boolean')S.inside=p.inside;
     if(typeof p.vol==='number'){$('#vol').value=clamp(p.vol,0,100);sound.setVol($('#vol').value/100)}
     if(typeof p.sound==='boolean')sound.setOn(p.sound);
@@ -1337,14 +1490,27 @@ async function doSave(manual){
     toast(e&&e.name==='QuotaExceededError'?'Your device is out of storage space. Delete something in My Coloring Library.':"Couldn't save your progress. Try again in a moment.");
   }
 }
+let finishing=false;
 async function finishProject(){
-  if(!S.w)return;
-  const blob=await composeBlob(S.srcImg,paint);
-  if(!blob){toast("Couldn't finish this page");return}
-  S.status='finished';S.finalBlob=blob;await enqueue(()=>doSave(false));
-  const r=await ask({title:'Page finished!',text:'It is saved in Finished Coloring Pages in My Library.',buttons:[{label:'Download my picture',value:'dl',cls:'blue'},{label:'Open My Library',value:'lib',cls:'lav'},{label:'Keep coloring',value:'stay'}]});
-  if(r==='dl')await saveFile(blob,safeName(nameEl.value,'my-coloring')+'.png');
-  else if(r==='lib')showView('library');
+  if(!S.w||finishing)return;finishing=true;
+  try{
+    const blob=await composeBlob(S.srcImg,paint);
+    if(!blob||!blob.size){toast("Couldn't finish this page. Nothing was changed.");return}
+    const prevStatus=S.status,prevFinal=S.finalBlob;
+    S.status='finished';S.finalBlob=blob;
+    await enqueue(()=>doSave(false));
+    /* the picture only leaves Uploaded Pictures once the finished page is read back from storage and checked */
+    let ok=false;
+    try{
+      const q=S.projectId&&await store.get('projects',S.projectId);
+      const pic=q&&await store.get('pictures',q.pictureId);
+      ok=!!(q&&q.status==='finished'&&q.finalBlob&&q.finalBlob.size>0&&q.paintBlob&&pic&&pic.blob&&pic.blob.size>0);
+    }catch(e){ok=false}
+    if(!ok){S.status=prevStatus;S.finalBlob=prevFinal;S.dirty=true;setSaveState('error');toast("Couldn't save the finished page, so your picture was left where it is. Try again.");return}
+    const r=await ask({title:'Page finished!',text:'It moved to Finished Coloring Pages in My Library. Your original picture is kept safe.',buttons:[{label:'Download my picture',value:'dl',cls:'blue'},{label:'Open My Library',value:'lib',cls:'lav'},{label:'Keep coloring',value:'stay'}]});
+    if(r==='dl')await saveFile(blob,safeName(nameEl.value,'my-coloring')+'.png');
+    else if(r==='lib')showView('library');
+  }finally{finishing=false}
 }
 async function downloadCurrent(){
   if(!S.w)return;
@@ -1490,12 +1656,19 @@ async function addFiles(list,openFirst){
 
 /* ---------- opening pictures and projects ---------- */
 async function openPage(it){
-  const blob=await it.blob();if(!blob){toast('That page could not be opened');return}
+  let blob=null;try{blob=await it.blob()}catch(e){}
+  if(!blob){toast('That page could not be opened. Check your internet and try again.');return}
   await showView('studio',true);await flushSave();
   const prjs=(await store.all('projects')).filter(q=>q.pictureId===it.id&&q.status!=='finished').sort((a,b)=>b.updated-a.updated);
   if(prjs[0]){const ok=await loadPage({blob,pictureId:it.id,picName:it.title,name:prjs[0].name,projectId:prjs[0].id,paintBlob:prjs[0].paintBlob,status:prjs[0].status,sample:false});if(ok){syncFavPage();updateNameLabel();toast('Continuing where you left off')}return}
   const ok=await loadPage({blob,pictureId:it.id,picName:it.title,name:it.title});
   if(ok){syncFavPage();updateNameLabel()}
+}
+async function colorAgain(q){
+  const pic=await store.get('pictures',q.pictureId);if(!pic){toast('The original picture is missing');return}
+  await showView('studio',true);await flushSave();
+  const ok=await loadPage({blob:pic.blob,pictureId:pic.id,picName:pic.name,name:q.name+' (again)'});
+  if(ok){syncFavPage();updateNameLabel();toast('A fresh copy to color. Your finished page is kept.')}
 }
 async function openPicture(id){
   const pic=await store.get('pictures',id);if(!pic){toast('That picture was not found');return}
@@ -1533,7 +1706,8 @@ async function viewFinished(q){
 }
 async function renderLibrary(){
   const [pics0,prjs]=await Promise.all([store.all('pictures'),store.all('projects')]);
-  const pics=pics0.filter(isUpload);
+  const finIds=new Set(prjs.filter(q=>q.status==='finished'&&q.finalBlob).map(q=>q.pictureId));
+  const pics=pics0.filter(p=>isUpload(p)&&!finIds.has(p.id));   // finished pictures move to Finished Coloring Pages; the original stays stored safely
   pics.sort((a,b)=>b.added-a.added);prjs.sort((a,b)=>b.updated-a.updated);
   $('#memWarn').hidden=store.mode!=='mem';
   const pg=$('#picGrid'),dg=$('#doneGrid'),wg=$('#wipGrid');pg.innerHTML=dg.innerHTML=wg.innerHTML='';
@@ -1554,7 +1728,7 @@ async function renderLibrary(){
   const ren=q=>async()=>{const n=await askText('Rename','Give this page a new name.',q.name);if(n){q.name=n;await store.put('projects',q);if(S.projectId===q.id){nameEl.value=n;updateNameLabel()}renderLibrary()}};
   const doneCard=q=>makeCard({title:q.name,thumb:q.thumb,meta:nameOf(q.pictureId)+' · '+fmtDate(q.updated),badge:'Finished',
     main:{label:'View',fn:()=>viewFinished(q)},
-    more:[{label:'Download',cls:'blue',fn:()=>downloadProject(q)},{label:'Rename',fn:ren(q)},{label:'Delete',fn:del(q)}]});
+    more:[{label:'Color again',cls:'lav',fn:()=>colorAgain(q)},{label:'Download',cls:'blue',fn:()=>downloadProject(q)},{label:'Rename',fn:ren(q)},{label:'Delete',fn:del(q)}]});
   const wipCard=q=>makeCard({title:q.name,thumb:q.thumb,meta:nameOf(q.pictureId)+' · '+fmtDate(q.updated),badge:'',
     main:{label:'Continue Coloring',fn:()=>openProject(q.id)},
     more:[{label:'Download',cls:'blue',fn:()=>downloadProject(q)},{label:'Rename',fn:ren(q)},{label:'Delete',fn:del(q)}]});
@@ -1588,7 +1762,7 @@ function renderRecent(){}
 /* ---------- catalogue, favorites, home and gallery ---------- */
 const isUpload=p=>!BUILTIN_MAP[p.id]&&!p.builtin&&p.id!=='sample';
 async function pageItems(){
-  const items=BUILTINS.map(b=>({id:b.id,title:b.title,cat:b.cat,added:b.added,builtin:true,thumb:()=>builtinThumb(b),blob:async()=>svgBlobOf(b)}));
+  const items=BUILTINS.map(b=>({id:b.id,title:b.title,cat:b.cat,added:b.added,builtin:true,thumb:()=>builtinThumb(b),blob:()=>blobOfPage(b)}));
   (await store.all('pictures')).filter(isUpload).forEach(p=>items.push({id:p.id,title:p.name,cat:'My Uploads',added:p.added||0,builtin:false,thumb:()=>p.thumb||'',blob:async()=>p.blob}));
   return items;
 }
@@ -1786,7 +1960,7 @@ document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&k==='y'){e.preventDefault();redo();return}
   if(e.ctrlKey||e.metaKey||e.altKey)return;
   if(KEYS[k]&&tg!=='BUTTON'){setTool(KEYS[k]);return}
-  if(k==='['||k===']'){const p=prefs[S.tool];if(p.size){p.size=clamp(p.size+(k===']'?2:-2),1,80);syncBrush();savePrefs()}}
+  if(k==='['||k===']'){const p=prefs[S.tool];if(p.size){p.size=clamp(p.size+(k===']'?2:-2),.5,80);syncBrush();savePrefs()}}
   if(k==='+'||k==='=')setZoom(S.zoom*1.2);if(k==='-')setZoom(S.zoom/1.2);if(k==='0')fitView();
 });
 document.addEventListener('keyup',e=>{if(e.code==='Space')space=false});
@@ -1799,6 +1973,7 @@ document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement
 (async function start(){
   syncSound();syncHist();
   await store.init();
+  await loadExtraPages();
   await loadPrefs();prefsReady=true;
   await showView(viewFromHash());
   if(store.mode==='mem')setSaveState('mem');
